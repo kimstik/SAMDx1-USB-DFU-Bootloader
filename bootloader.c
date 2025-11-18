@@ -119,11 +119,30 @@ static void USB_Service(void)
   {
     if (dfu_addr)
     {
+      /* FIXME: MEDIUM PRIORITY - No error checking on flash operations
+       * Flash erase and write operations can fail, but there is no checking of
+       * NVMCTRL status register for errors (PROGE, LOCKE, NVME bits).
+       * Also, no verification that data was written correctly.
+       *
+       * RECOMMENDATION: Check INTFLAG.ERROR bit and verify write operation.
+       * Proposed fix (commented out):
+       */
+
       if (0 == ((dfu_addr >> 6) & 0x3))
       {
         NVMCTRL->ADDR.reg = dfu_addr >> 1;
         NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD(NVMCTRL_CTRLA_CMD_ER);
         while (!NVMCTRL->INTFLAG.bit.READY);
+        /*
+        if (NVMCTRL->INTFLAG.bit.ERROR) {
+          // Erase error occurred - report error to host
+          NVMCTRL->INTFLAG.reg = NVMCTRL_INTFLAG_ERROR;  // Clear error
+          dfu_status = dfu_status_choices + 0;  // Return to idle state
+          dfu_addr = 0;
+          USB->DEVICE.DeviceEndpoint[0].EPSTATUSSET.bit.STALLRQ1 = 1;  // Stall endpoint
+          return;
+        }
+        */
       }
 
       uint16_t *nvm_addr = (uint16_t *)(dfu_addr);
@@ -131,6 +150,20 @@ static void USB_Service(void)
       for (unsigned i = 0; i < 32; i++)
         *nvm_addr++ = *ram_addr++;
       while (!NVMCTRL->INTFLAG.bit.READY);
+      /*
+      // Verify write operation
+      nvm_addr = (uint16_t *)(dfu_addr);
+      ram_addr = (uint16_t *)udc_ctrl_out_buf;
+      for (unsigned i = 0; i < 32; i++) {
+        if (*nvm_addr++ != *ram_addr++) {
+          // Verification failed
+          dfu_status = dfu_status_choices + 0;
+          dfu_addr = 0;
+          USB->DEVICE.DeviceEndpoint[0].EPSTATUSSET.bit.STALLRQ1 = 1;
+          return;
+        }
+      }
+      */
 
       udc_control_send_zlp();
       dfu_addr = 0;
@@ -198,6 +231,19 @@ static void USB_Service(void)
       }
       break;
     case SIMPLE_USB_CMD(INTERFACE, CLASS):
+      /* FIXME: LOW PRIORITY - Magic numbers for DFU commands
+       * DFU command values are hardcoded. Should use named constants for readability.
+       * Proposed defines (commented out):
+       */
+      /*
+      #define DFU_DETACH    0x00
+      #define DFU_DNLOAD    0x01
+      #define DFU_UPLOAD    0x02
+      #define DFU_GETSTATUS 0x03
+      #define DFU_CLRSTATUS 0x04
+      #define DFU_GETSTATE  0x05
+      #define DFU_ABORT     0x06
+      */
       switch (request->bRequest)
       {
         case 0x03: // DFU_GETSTATUS
@@ -211,6 +257,28 @@ static void USB_Service(void)
           if (request->wLength)
           {
             dfu_status = dfu_status_choices + 2;
+
+            /* FIXME: CRITICAL SECURITY ISSUE - Missing DFU address range validation
+             * The wValue field from USB request is used to calculate flash address without
+             * bounds checking. A malicious host could send wValue=0xFFFF, resulting in
+             * dfu_addr = 0x400 + 0xFFFF * 64 = 0x3FFFC4, which is beyond flash memory.
+             * This could corrupt memory, write to fuse bits, or brick the device.
+             *
+             * RECOMMENDATION: Validate block number before calculating address.
+             * Proposed fix (commented out - requires FLASH_SIZE definition):
+             */
+            /*
+            uint32_t block_num = request->wValue;
+            uint32_t max_blocks = (FLASH_SIZE - 0x400) / 64;
+            if (block_num >= max_blocks) {
+              // Invalid block number - stall the endpoint
+              USB->DEVICE.DeviceEndpoint[0].EPSTATUSSET.bit.STALLRQ1 = 1;
+              dfu_addr = 0;
+              dfu_status = dfu_status_choices + 0;
+              break;
+            }
+            dfu_addr = 0x400 + block_num * 64;
+            */
             dfu_addr = 0x400 + request->wValue * 64;
           }
           /* fall through */
@@ -242,6 +310,22 @@ void bootloader(void)
   PAC1->WPCLR.reg = 2; /* clear DSU */
 
   DSU->ADDR.reg = 0x400; /* start CRC check at beginning of user app */
+
+  /* FIXME: CRITICAL SECURITY ISSUE - Unvalidated CRC length field
+   * The length value is read from user application at offset 0x10 without validation.
+   * A malicious application could set length to 0x00000000 (always pass CRC) or
+   * 0xFFFFFFFF (read beyond application space), allowing corrupted firmware to boot.
+   *
+   * RECOMMENDATION: Add bounds checking before using the length value.
+   * Proposed fix (commented out - requires FLASH_SIZE definition):
+   */
+  /*
+  uint32_t app_length = *(volatile uint32_t *)0x410;
+  if (app_length == 0 || app_length == 0xFFFFFFFF || app_length > (FLASH_SIZE - 0x400)) {
+    goto run_bootloader;  // Invalid length, refuse to boot
+  }
+  DSU->LENGTH.reg = app_length;
+  */
   DSU->LENGTH.reg = *(volatile uint32_t *)0x410; /* use length encoded into unused vector address in user app */
 
   /* ask DSU to compute CRC */
